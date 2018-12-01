@@ -3,11 +3,10 @@ extern crate openssl;
 extern crate otpauth;
 extern crate time;
 
-use openssl::aes::{AesKey, KeyError, aes_ige};
+use openssl::aes::{AesKey, aes_ige};
 use openssl::symm::Mode;
-use hex::{FromHex, ToHex};
+use hex::{FromHex};
 use otpauth::totp::TOTP;
-use std::time::SystemTime;
 use std::thread;
 
 
@@ -72,6 +71,8 @@ fn plus_one(number: i32) {
     println!("{}", other);
 }
 
+//use crypto::Crypto;
+
 fn main() {
     let x1 = "Guess";
 
@@ -80,14 +81,14 @@ fn main() {
 
     println!("Please input your guess.");
 
-    let mut guess = String::new();
+    let guess = String::new();
 
    // io::stdin().read_line(&mut guess)
     //    .expect("Failed to read line");
 
     println!("You guessed: {}", guess);
 
-    let mut x = 200;
+    let x = 200;
     plus_one( x);
     println!("{}", x);
     aes_test();

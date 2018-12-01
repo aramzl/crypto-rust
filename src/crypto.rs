@@ -10,13 +10,13 @@ use otpauth::totp::TOTP;
 use std::time::SystemTime;
 use std::thread;
 
-struct Crypto {
+pub struct Crypto {
     key: vec,
     iv: vec,
     time_key: vec,
 }
 
-trait CryptoService {
+pub trait CryptoService {
     fn new(key: vec, iv: vec, time_key: vec) -> Self;
     fn encrypt(&self, msg: &vec) -> vec;
     fn decrypt(&self, encrypted: &vec) -> vec;
@@ -104,3 +104,4 @@ impl CryptoService for Crypto {
         }
     }
 }
+
