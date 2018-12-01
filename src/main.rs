@@ -1,11 +1,15 @@
 extern crate hex;
 extern crate openssl;
-extern crate rustotp;
+extern crate otpauth;
+extern crate time;
 
 use openssl::aes::{AesKey, KeyError, aes_ige};
 use openssl::symm::Mode;
 use hex::{FromHex, ToHex};
-use rustotp::totp;
+use otpauth::totp::TOTP;
+use std::time::SystemTime;
+use std::thread;
+
 
 fn aes_test() {
     let raw_key = "000102030405060708090A0B0C0D0E0F10111212121212121212121212121212";
@@ -42,9 +46,23 @@ fn aes_test() {
 }
 
 fn totp_test() {
-    let key = "12345678901234567890".as_bytes();
-    let current_time = 59;
-    let totp_value = rustotp::totp(8, 30, key, current_time);
+    let key = "12345678901234567890";
+    let ten_millis = std::time::Duration::from_millis(1000);
+    let auth = TOTP::new(key);
+
+    for x in 0..50 {
+        let timestamp1 = time::now().to_timespec().sec as usize;
+        let code = auth.generate(30, timestamp1);
+        //println!("{}", code);
+        println!("{} now", x); // x: i32
+        thread::sleep(ten_millis);
+        let timestamp2 = time::now().to_timespec().sec as usize;
+        let verification = auth.verify(code, 30, timestamp2);
+        if !verification {
+            println!("CODE: {}", code);
+        }
+        //println!("verify {}", verification);
+    }
 }
 
 fn plus_one(number: i32) {
@@ -73,4 +91,5 @@ fn main() {
     plus_one( x);
     println!("{}", x);
     aes_test();
+    totp_test();
 }
