@@ -29,6 +29,15 @@ pub trait CryptoService {
 
 impl CryptoService for Crypto {
     fn new(key: Vec<u8>, iv: Vec<u8>, time_key: Vec<u8>) -> Self {
+        if key.len() != 16 && key.len() != 24 && key.len() != 32 {
+            panic!("Error creating AES key (must be 128, 192, or 256 bits)");
+        }
+        if iv.len() % 2 != 0 || iv.len() < 4 {
+            panic!("Error creating IV (must be at least 32 bits and multiple of 16)");
+        }
+        if time_key.len() < 4 {
+            panic!("Error creating TOTP key (must be at least 32 bits)");
+        }
         Crypto {
             key,
             iv,
@@ -59,7 +68,10 @@ impl CryptoService for Crypto {
     }
 
     fn encrypt_internal(&self, msg: &Vec<u8>, key: &Vec<u8>) -> Vec<u8> {
-        let encrypt_key = AesKey::new_encrypt(&key).unwrap();
+        if msg.len() % 16 != 0 {
+            panic!("Message vec size must be multiple of 16 current {}", msg.len());
+        }
+        let encrypt_key = AesKey::new_encrypt(key).unwrap();
         let mut vec_encrypt = vec![0; msg.len()];
         let mut vec_iv = self.iv.to_vec();
         aes_ige(&msg, &mut vec_encrypt, &encrypt_key, &mut vec_iv, Mode::Encrypt);
@@ -67,9 +79,12 @@ impl CryptoService for Crypto {
     }
 
     fn decrypt_internal(&self, encrypted: &Vec<u8>, key: &Vec<u8>) -> Vec<u8> {
+        if encrypted.len() % 16 != 0 {
+            panic!("Encrypted vec size must be multiple of 16 current {}", encrypted.len());
+        }
         let decrypt_key = AesKey::new_decrypt(&key).unwrap();
         let mut msg = vec![0; encrypted.len()];
-        let mut vec_iv = self.key.to_vec();
+        let mut vec_iv = self.iv.to_vec();
         aes_ige(&encrypted, &mut msg, &decrypt_key, &mut vec_iv, Mode::Decrypt);
         msg
     }
