@@ -67,8 +67,8 @@ mod tests {
         println!("Encrypted {}", String::from_utf8_lossy(&encrypted));
         assert_ne!("Time based tests rust. Secret2!!", String::from_utf8_lossy(&encrypted));
 
-        let ten_millis = std::time::Duration::from_millis(30000);
-        thread::sleep(ten_millis);
+        let millis = std::time::Duration::from_millis(30000);
+        thread::sleep(millis);
 
         let original = CryptoService::decrypt_time_based(&crypto, &encrypted);
 
@@ -88,8 +88,8 @@ mod tests {
         println!("Encrypted {}", String::from_utf8_lossy(&encrypted));
         assert_ne!("Time based tests rust. Secret3!!", String::from_utf8_lossy(&encrypted));
 
-        let ten_millis = std::time::Duration::from_millis(30000);
-        thread::sleep(ten_millis);
+        let millis = std::time::Duration::from_millis(30000);
+        thread::sleep(millis);
 
         let encrypted_2 = CryptoService::encrypt_time_based(&crypto, &msg);
         let original = CryptoService::decrypt_time_based(&crypto, &encrypted_2);
