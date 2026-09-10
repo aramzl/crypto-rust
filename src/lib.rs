@@ -1,8 +1,26 @@
 //! Combining AES with TOTP for time-based key derivation.
 //!
-//! A new AES key is derived every `PERIOD` seconds from the master key and the
-//! current TOTP code, so both sides stay in sync without exchanging anything
-//! beyond the original shared secrets.
+//! A new AES key is derived every [`PERIOD`] seconds from the master key and
+//! the current TOTP code, so both sides stay in sync without exchanging
+//! anything beyond the original shared secrets.
+//!
+//! ```
+//! use crypto_service::{Crypto, CryptoService};
+//!
+//! // Both ends hold the same three secrets; nothing else is exchanged.
+//! let crypto = Crypto::new(
+//!     b"12345678901234567890123456789012".to_vec(), // AES key
+//!     b"21098765432109876543210987654321".to_vec(), // IV
+//!     b"00010203040506070809".to_vec(),             // TOTP secret
+//! )?;
+//!
+//! let msg = b"sixteen byte msg";
+//! let encrypted = crypto.encrypt_time_based(msg)?;
+//! assert_eq!(crypto.decrypt_time_based(&encrypted)?, msg);
+//! # Ok::<(), crypto_service::CryptoError>(())
+//! ```
+
+#![warn(missing_docs)]
 
 use openssl::aes::{aes_ige, AesKey};
 use openssl::hash::MessageDigest;
@@ -25,7 +43,7 @@ pub const BLOCK_LEN: usize = 16;
 
 /// Length of the HMAC-SHA256 authentication tag appended to time-based
 /// ciphertexts.
-const TAG_LEN: usize = 32;
+pub const TAG_LEN: usize = 32;
 
 /// How far into a new period the *previous* period's key is still accepted,
 /// as a percentage of `PERIOD`. Bounds how long a stale ciphertext stays
@@ -86,29 +104,214 @@ impl fmt::Display for CryptoError {
 
 impl std::error::Error for CryptoError {}
 
+/// Holds the three shared secrets both ends of a conversation must agree on:
+/// the AES master key, the IV, and the TOTP secret.
+///
+/// None of the three is ever transmitted. Per-period keys are derived from the
+/// master key and the TOTP secret, so two parties with the same secrets and
+/// roughly synchronised clocks arrive at the same key independently.
+///
+/// Construct one with [`CryptoService::new`], which validates all three
+/// lengths. The struct deliberately implements neither `Debug` nor `Clone`, so
+/// the secrets cannot be printed into a log or duplicated by accident.
 pub struct Crypto {
     key: Vec<u8>,
     iv: Vec<u8>,
     time_key: Vec<u8>,
 }
 
+/// The operations [`Crypto`] provides.
+///
+/// Two families of methods:
+///
+/// * [`encrypt`](Self::encrypt) / [`decrypt`](Self::decrypt) use the master key
+///   directly. They are unauthenticated: a modified ciphertext decrypts to
+///   plausible-looking garbage with no error.
+/// * [`encrypt_time_based`](Self::encrypt_time_based) /
+///   [`decrypt_time_based`](Self::decrypt_time_based) use a key that rotates
+///   every [`PERIOD`] seconds and append an HMAC-SHA256 tag, so a wrong key or
+///   a tampered message is detected rather than silently mis-decrypted.
+///
+/// Prefer the time-based pair unless you specifically need a static key.
 pub trait CryptoService {
+    /// Validates the three shared secrets and builds a [`Crypto`].
+    ///
+    /// `key` must be 16, 24 or 32 bytes (AES-128/192/256), `iv` exactly
+    /// [`IV_LEN`] bytes, and `time_key` at least 4 bytes. The TOTP secret is
+    /// taken as raw bytes, not as text.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::InvalidKeyLength`], [`CryptoError::InvalidIvLength`] or
+    /// [`CryptoError::InvalidTimeKeyLength`], each carrying the length given.
+    ///
+    /// ```
+    /// use crypto_service::{Crypto, CryptoError, CryptoService};
+    ///
+    /// let ok = Crypto::new(
+    ///     vec![0; 32],
+    ///     vec![0; 32],
+    ///     b"00010203040506070809".to_vec(),
+    /// );
+    /// assert!(ok.is_ok());
+    ///
+    /// let bad = Crypto::new(vec![0; 20], vec![0; 32], vec![0; 20]);
+    /// assert_eq!(bad.err(), Some(CryptoError::InvalidKeyLength(20)));
+    /// ```
     fn new(key: Vec<u8>, iv: Vec<u8>, time_key: Vec<u8>) -> Result<Self, CryptoError>
     where
         Self: Sized;
+
+    /// Encrypts under the static master key, with no authentication tag.
+    ///
+    /// Output is the same length as `msg`. Because the IV is fixed, encrypting
+    /// the same plaintext twice produces identical ciphertext.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::NotBlockAligned`] if `msg` is not a multiple of
+    /// [`BLOCK_LEN`] bytes.
     fn encrypt(&self, msg: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// Decrypts what [`encrypt`](Self::encrypt) produced.
+    ///
+    /// There is no integrity check: if `encrypted` was modified or truncated in
+    /// transit, this returns the resulting bytes without complaint. Use
+    /// [`decrypt_time_based`](Self::decrypt_time_based) where that matters.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::NotBlockAligned`] if `encrypted` is not a multiple of
+    /// [`BLOCK_LEN`] bytes.
     fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// Encrypts under the current period's key and appends an authentication
+    /// tag.
+    ///
+    /// Output is [`TAG_LEN`] bytes longer than `msg`. Messages are always
+    /// encrypted with the *current* key, never the previous one.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::NotBlockAligned`] if `msg` is not a multiple of
+    /// [`BLOCK_LEN`] bytes.
+    ///
+    /// ```
+    /// use crypto_service::{Crypto, CryptoService};
+    ///
+    /// let crypto = Crypto::new(
+    ///     b"12345678901234567890123456789012".to_vec(),
+    ///     b"21098765432109876543210987654321".to_vec(),
+    ///     b"00010203040506070809".to_vec(),
+    /// )?;
+    ///
+    /// let msg = b"sixteen byte msg";
+    /// let encrypted = crypto.encrypt_time_based(msg)?;
+    /// assert_eq!(encrypted.len(), msg.len() + 32);
+    /// assert_eq!(crypto.decrypt_time_based(&encrypted)?, msg);
+    /// # Ok::<(), crypto_service::CryptoError>(())
+    /// ```
     fn encrypt_time_based(&self, msg: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// Authenticates and decrypts against the current clock.
+    ///
+    /// Equivalent to [`decrypt_time_based_at`](Self::decrypt_time_based_at)
+    /// with the current Unix time, including its tolerance window.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::TooShort`] if smaller than the tag,
+    /// [`CryptoError::NotAuthenticated`] if no candidate key verifies.
     fn decrypt_time_based(&self, encrypted: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// [`encrypt_time_based`](Self::encrypt_time_based) pinned to an explicit
+    /// Unix timestamp instead of the system clock.
+    ///
+    /// Useful in tests, and for replaying a known instant. The period used is
+    /// `timestamp / PERIOD`.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::NotBlockAligned`] if `msg` is not a multiple of
+    /// [`BLOCK_LEN`] bytes.
     fn encrypt_time_based_at(&self, msg: &[u8], timestamp: u64) -> Result<Vec<u8>, CryptoError>;
+
+    /// Authenticates and decrypts as of `timestamp`.
+    ///
+    /// Tries the current period's key first. If its tag does not verify and
+    /// `timestamp` falls within [`tolerance`] seconds of the period start, the
+    /// previous period's key is tried too — so a message sent just before a
+    /// rotation still arrives just after one.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::TooShort`] if `encrypted` is smaller than the tag,
+    /// [`CryptoError::NotAuthenticated`] if no candidate key verifies — which
+    /// covers a wrong period, a tampered message and a truncated one alike.
+    ///
+    /// ```
+    /// use crypto_service::{tolerance, Crypto, CryptoService, PERIOD};
+    ///
+    /// let crypto = Crypto::new(
+    ///     b"12345678901234567890123456789012".to_vec(),
+    ///     b"21098765432109876543210987654321".to_vec(),
+    ///     b"00010203040506070809".to_vec(),
+    /// )?;
+    ///
+    /// let base = 1_700_000_010; // period-aligned
+    /// let msg = b"sixteen byte msg";
+    ///
+    /// // Sent in the last second of a period.
+    /// let sent = crypto.encrypt_time_based_at(msg, base + PERIOD - 1)?;
+    ///
+    /// // Still readable inside the next period's tolerance window...
+    /// assert!(crypto.decrypt_time_based_at(&sent, base + PERIOD).is_ok());
+    ///
+    /// // ...but not after it closes.
+    /// assert!(crypto
+    ///     .decrypt_time_based_at(&sent, base + PERIOD + tolerance())
+    ///     .is_err());
+    /// # Ok::<(), crypto_service::CryptoError>(())
+    /// ```
     fn decrypt_time_based_at(
         &self,
         encrypted: &[u8],
         timestamp: u64,
     ) -> Result<Vec<u8>, CryptoError>;
+
+    /// Raw AES-IGE encryption under an explicit `key`, with no tag.
+    ///
+    /// The building block the methods above are written in terms of. Prefer
+    /// those; this is exposed only because it is part of the trait.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::NotBlockAligned`] if `msg` is misaligned, or
+    /// [`CryptoError::InvalidKeyLength`] if `key` is not a valid AES size.
     fn encrypt_internal(&self, msg: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// Raw AES-IGE decryption under an explicit `key`. Counterpart to
+    /// [`encrypt_internal`](Self::encrypt_internal), with the same caveats.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::NotBlockAligned`] if `encrypted` is misaligned, or
+    /// [`CryptoError::InvalidKeyLength`] if `key` is not a valid AES size.
     fn decrypt_internal(&self, encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// The AES key for the period containing `timestamp`.
+    ///
+    /// `HMAC-SHA256(master_key, label || counter || totp_code)`, truncated to
+    /// the master key's length. HMAC is a pseudo-random function, so holding
+    /// one period's key reveals nothing about the master key or about any
+    /// other period.
     fn create_key(&self, timestamp: u64) -> Vec<u8>;
+
+    /// The TOTP code for the period containing `timestamp`, as six ASCII
+    /// digits.
+    ///
+    /// Always six bytes: codes below 100000 are zero-padded, so the value fed
+    /// into key derivation has a fixed width.
     fn create_token(&self, timestamp: u64) -> Vec<u8>;
 }
 
