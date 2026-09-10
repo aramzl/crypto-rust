@@ -67,6 +67,11 @@ bytes longer than the plaintext. The MAC key is derived separately from the AES
 key and rotates on the same schedule, which is what lets decryption tell *which*
 period a message belongs to rather than guessing.
 
+Each period derives both subkeys as
+`HMAC-SHA256(master_key, label || counter || totp_code)`. HMAC is a
+pseudo-random function, so a leaked period key reveals nothing about the master
+key or about any other period.
+
 To pin a specific window — in tests, or to replay a known instant — use the
 `_at` variants:
 

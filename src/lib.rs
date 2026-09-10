@@ -1,8 +1,8 @@
 //! Combining AES with TOTP for time-based key derivation.
 //!
-//! A new AES key is derived every `PERIOD` seconds by mixing the master key
-//! with the current TOTP code, so both sides stay in sync without exchanging
-//! anything beyond the original shared secrets.
+//! A new AES key is derived every `PERIOD` seconds from the master key and the
+//! current TOTP code, so both sides stay in sync without exchanging anything
+//! beyond the original shared secrets.
 
 use openssl::aes::{aes_ige, AesKey};
 use openssl::hash::MessageDigest;
@@ -32,7 +32,8 @@ const TAG_LEN: usize = 32;
 /// decryptable: with `PERIOD` 30 and 20%, that is 6 seconds.
 const TOLERANCE_PERCENT: u64 = 20;
 
-/// Domain separator so the MAC subkey can never collide with the AES subkey.
+/// Domain separators keeping the two per-period subkeys independent.
+const ENC_LABEL: &[u8] = b"crypto-service:enc-v1";
 const MAC_LABEL: &[u8] = b"crypto-service:mac-v1";
 
 /// Seconds into a period during which the previous period's key is accepted.
@@ -101,15 +102,6 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut signer =
         Signer::new(MessageDigest::sha256(), &pkey).expect("SHA-256 is always available");
     signer.sign_oneshot_to_vec(data).expect("HMAC cannot fail")
-}
-
-/// XOR `b` into a copy of `a`, stopping at whichever is shorter.
-fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let mut out = a.to_vec();
-    for (dst, src) in out.iter_mut().zip(b) {
-        *dst ^= src;
-    }
-    out
 }
 
 impl CryptoService for Crypto {
@@ -238,8 +230,7 @@ impl CryptoService for Crypto {
     }
 
     fn create_key(&self, timestamp: u64) -> Vec<u8> {
-        let token = self.create_token(timestamp);
-        xor(&self.key, &token)
+        self.key_for(timestamp / PERIOD)
     }
 
     fn create_token(&self, timestamp: u64) -> Vec<u8> {
@@ -252,22 +243,35 @@ impl CryptoService for Crypto {
 }
 
 impl Crypto {
-    /// AES key for a specific period counter.
-    fn key_for(&self, counter: u64) -> Vec<u8> {
-        self.create_key(counter * PERIOD)
-    }
-
-    /// MAC key for a specific period counter.
+    /// Derive a per-period subkey from the master key.
     ///
-    /// Derived from the master key and the period's token under a domain
-    /// separator, so it is independent of the AES subkey and rotates on the
-    /// same schedule. Verifying a tag therefore identifies *which* period a
-    /// ciphertext belongs to.
-    fn mac_key_for(&self, counter: u64) -> Vec<u8> {
+    /// `HMAC-SHA256(master_key, label || counter || token)`. HMAC is a
+    /// pseudo-random function, so an attacker who obtains one period's subkey
+    /// learns nothing about the master key or about any other period — which
+    /// is what makes rotation meaningful. The `label` keeps the encryption and
+    /// MAC subkeys independent of each other, and the `counter` keeps two
+    /// periods distinct even in the rare case their TOTP codes collide.
+    fn derive(&self, label: &[u8], counter: u64) -> Vec<u8> {
         let token = self.create_token(counter * PERIOD);
-        let mut data = MAC_LABEL.to_vec();
+        let mut data = label.to_vec();
+        data.extend_from_slice(&counter.to_be_bytes());
         data.extend_from_slice(&token);
         hmac(&self.key, &data)
+    }
+
+    /// AES key for a specific period counter, truncated to the master key's
+    /// length so 128-, 192- and 256-bit master keys all stay valid.
+    fn key_for(&self, counter: u64) -> Vec<u8> {
+        let mut key = self.derive(ENC_LABEL, counter);
+        key.truncate(self.key.len());
+        key
+    }
+
+    /// MAC key for a specific period counter. Rotates on the same schedule as
+    /// the AES subkey, so verifying a tag identifies *which* period a
+    /// ciphertext belongs to.
+    fn mac_key_for(&self, counter: u64) -> Vec<u8> {
+        self.derive(MAC_LABEL, counter)
     }
 }
 
@@ -284,16 +288,44 @@ mod tests {
     }
 
     #[test]
-    fn xor_stops_at_the_shorter_input() {
-        assert_eq!(
-            xor(&[0xff, 0x0f, 0xaa], &[0x0f, 0xff]),
-            vec![0xf0, 0xf0, 0xaa]
+    fn period_key_leaks_no_master_key_bytes() {
+        // The property the HMAC derivation exists for. The previous XOR scheme
+        // passed 26 of 32 master-key bytes through untouched, so leaking one
+        // period key gave up the master key.
+        let crypto = crypto();
+        let derived = crypto.create_key(0);
+        let shared = derived
+            .iter()
+            .zip(&crypto.key)
+            .filter(|(a, b)| a == b)
+            .count();
+        // A handful of coincidental byte matches is expected; a systematic
+        // prefix is not.
+        assert!(
+            shared < 4,
+            "{shared}/{} bytes match the master key",
+            derived.len()
         );
     }
 
     #[test]
-    fn xor_with_empty_is_identity() {
-        assert_eq!(xor(&[1, 2, 3], &[]), vec![1, 2, 3]);
+    fn period_keys_are_independent_of_each_other() {
+        let crypto = crypto();
+        let a = crypto.key_for(0);
+        let b = crypto.key_for(1);
+        let shared = a.iter().zip(&b).filter(|(x, y)| x == y).count();
+        assert!(
+            shared < 4,
+            "{shared}/{} bytes shared between periods",
+            a.len()
+        );
+    }
+
+    #[test]
+    fn derivation_is_deterministic() {
+        let crypto = crypto();
+        assert_eq!(crypto.key_for(42), crypto.key_for(42));
+        assert_eq!(crypto.mac_key_for(42), crypto.mac_key_for(42));
     }
 
     #[test]
