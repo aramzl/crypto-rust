@@ -1,22 +1,22 @@
 //! Small demo of the library. Run with `cargo run`.
 
-use crypto_service::{tolerance, Crypto, CryptoService, PERIOD};
+use crypto_service::{tolerance, Crypto, CryptoError, CryptoService, PERIOD};
 
-fn main() {
+fn main() -> Result<(), CryptoError> {
     let crypto = Crypto::new(
         b"12345678901234567890123456789012".to_vec(),
         b"21098765432109876543210987654321".to_vec(),
         b"00010203040506070809".to_vec(),
-    );
+    )?;
 
     let msg = b"this is a secret message. secret";
     println!("original:  {}", String::from_utf8_lossy(msg));
 
-    let encrypted = crypto.encrypt(msg);
+    let encrypted = crypto.encrypt(msg)?;
     println!("encrypted: {}", hex::encode(&encrypted));
     println!(
         "decrypted: {}",
-        String::from_utf8_lossy(&crypto.decrypt(&encrypted))
+        String::from_utf8_lossy(&crypto.decrypt(&encrypted)?)
     );
 
     // A period-aligned instant, so the offsets below are easy to follow.
@@ -25,7 +25,7 @@ fn main() {
 
     // Sent one second before the key rotates.
     let sent_at = base + PERIOD - 1;
-    let ct = crypto.encrypt_time_based_at(msg, sent_at);
+    let ct = crypto.encrypt_time_based_at(msg, sent_at)?;
     println!(
         "\nsent at +{}s (last second of the period):",
         sent_at - base
@@ -37,6 +37,14 @@ fn main() {
 
     // Just past the tolerance window the message is refused outright.
     report(&crypto, &ct, base, base + PERIOD + tolerance());
+
+    // Misaligned input is now an error rather than a panic.
+    println!(
+        "\n33-byte message -> {:?}",
+        crypto.encrypt(&[0u8; 33]).unwrap_err()
+    );
+
+    Ok(())
 }
 
 fn report(crypto: &Crypto, ct: &[u8], base: u64, at: u64) {

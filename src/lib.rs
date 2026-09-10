@@ -18,10 +18,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const PERIOD: u64 = 30;
 
 /// AES-IGE operates on two blocks at a time, so the IV is twice the block size.
-const IV_LEN: usize = 32;
+pub const IV_LEN: usize = 32;
 
 /// Block size, in bytes, that messages must be a multiple of.
-const BLOCK_LEN: usize = 16;
+pub const BLOCK_LEN: usize = 16;
 
 /// Length of the HMAC-SHA256 authentication tag appended to time-based
 /// ciphertexts.
@@ -41,9 +41,19 @@ pub const fn tolerance() -> u64 {
     PERIOD * TOLERANCE_PERCENT / 100
 }
 
-/// Why a time-based decryption was rejected.
+/// Anything that can go wrong in this crate.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CryptoError {
+    /// AES keys must be 128, 192 or 256 bits. Carries the length supplied.
+    InvalidKeyLength(usize),
+    /// AES-IGE needs an IV of exactly [`IV_LEN`] bytes. Carries the length
+    /// supplied.
+    InvalidIvLength(usize),
+    /// The TOTP secret was shorter than 32 bits. Carries the length supplied.
+    InvalidTimeKeyLength(usize),
+    /// AES-IGE is a block cipher with no padding, so input length must be a
+    /// multiple of [`BLOCK_LEN`]. Carries the length supplied.
+    NotBlockAligned(usize),
     /// Fewer bytes than the authentication tag alone requires.
     TooShort,
     /// The tag matched neither the current period's key nor, where the
@@ -54,6 +64,18 @@ pub enum CryptoError {
 impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CryptoError::InvalidKeyLength(n) => {
+                write!(f, "AES key must be 16, 24 or 32 bytes, got {n}")
+            }
+            CryptoError::InvalidIvLength(n) => {
+                write!(f, "IV must be exactly {IV_LEN} bytes, got {n}")
+            }
+            CryptoError::InvalidTimeKeyLength(n) => {
+                write!(f, "TOTP secret must be at least 4 bytes, got {n}")
+            }
+            CryptoError::NotBlockAligned(n) => {
+                write!(f, "input must be a multiple of {BLOCK_LEN} bytes, got {n}")
+            }
             CryptoError::TooShort => write!(f, "ciphertext is shorter than the authentication tag"),
             CryptoError::NotAuthenticated => {
                 write!(f, "authentication failed for every candidate period key")
@@ -71,19 +93,21 @@ pub struct Crypto {
 }
 
 pub trait CryptoService {
-    fn new(key: Vec<u8>, iv: Vec<u8>, time_key: Vec<u8>) -> Self;
-    fn encrypt(&self, msg: &[u8]) -> Vec<u8>;
-    fn decrypt(&self, encrypted: &[u8]) -> Vec<u8>;
-    fn encrypt_time_based(&self, msg: &[u8]) -> Vec<u8>;
+    fn new(key: Vec<u8>, iv: Vec<u8>, time_key: Vec<u8>) -> Result<Self, CryptoError>
+    where
+        Self: Sized;
+    fn encrypt(&self, msg: &[u8]) -> Result<Vec<u8>, CryptoError>;
+    fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>, CryptoError>;
+    fn encrypt_time_based(&self, msg: &[u8]) -> Result<Vec<u8>, CryptoError>;
     fn decrypt_time_based(&self, encrypted: &[u8]) -> Result<Vec<u8>, CryptoError>;
-    fn encrypt_time_based_at(&self, msg: &[u8], timestamp: u64) -> Vec<u8>;
+    fn encrypt_time_based_at(&self, msg: &[u8], timestamp: u64) -> Result<Vec<u8>, CryptoError>;
     fn decrypt_time_based_at(
         &self,
         encrypted: &[u8],
         timestamp: u64,
     ) -> Result<Vec<u8>, CryptoError>;
-    fn encrypt_internal(&self, msg: &[u8], key: &[u8]) -> Vec<u8>;
-    fn decrypt_internal(&self, encrypted: &[u8], key: &[u8]) -> Vec<u8>;
+    fn encrypt_internal(&self, msg: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError>;
+    fn decrypt_internal(&self, encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError>;
     fn create_key(&self, timestamp: u64) -> Vec<u8>;
     fn create_token(&self, timestamp: u64) -> Vec<u8>;
 }
@@ -105,36 +129,57 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 impl CryptoService for Crypto {
-    fn new(key: Vec<u8>, iv: Vec<u8>, time_key: Vec<u8>) -> Self {
-        if key.len() != 16 && key.len() != 24 && key.len() != 32 {
-            panic!("Error creating AES key (must be 128, 192, or 256 bits)");
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::InvalidKeyLength`], [`CryptoError::InvalidIvLength`]
+    /// or [`CryptoError::InvalidTimeKeyLength`] if a secret is the wrong size.
+    fn new(key: Vec<u8>, iv: Vec<u8>, time_key: Vec<u8>) -> Result<Self, CryptoError> {
+        if !matches!(key.len(), 16 | 24 | 32) {
+            return Err(CryptoError::InvalidKeyLength(key.len()));
         }
         if iv.len() != IV_LEN {
-            panic!("Error creating IV (must be exactly {IV_LEN} bytes)");
+            return Err(CryptoError::InvalidIvLength(iv.len()));
         }
         if time_key.len() < 4 {
-            panic!("Error creating TOTP key (must be at least 32 bits)");
+            return Err(CryptoError::InvalidTimeKeyLength(time_key.len()));
         }
-        Crypto { key, iv, time_key }
+        Ok(Crypto { key, iv, time_key })
     }
 
-    fn encrypt(&self, msg: &[u8]) -> Vec<u8> {
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::NotBlockAligned`] if `msg` is not a multiple of
+    /// [`BLOCK_LEN`] bytes.
+    fn encrypt(&self, msg: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.encrypt_internal(msg, &self.key)
     }
 
-    fn decrypt(&self, encrypted: &[u8]) -> Vec<u8> {
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::NotBlockAligned`] if `encrypted` is not a
+    /// multiple of [`BLOCK_LEN`] bytes.
+    fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.decrypt_internal(encrypted, &self.key)
     }
 
     /// Encrypts under the current period's key and appends an authentication
     /// tag. Output is `ciphertext || tag`, `TAG_LEN` bytes longer than `msg`.
-    fn encrypt_time_based(&self, msg: &[u8]) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::NotBlockAligned`] if `msg` is not a multiple of
+    /// [`BLOCK_LEN`] bytes.
+    fn encrypt_time_based(&self, msg: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.encrypt_time_based_at(msg, now())
     }
 
     /// Authenticates and decrypts, accepting the previous period's key while
     /// inside the tolerance window. See
     /// [`decrypt_time_based_at`](Self::decrypt_time_based_at).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::TooShort`] or [`CryptoError::NotAuthenticated`].
     fn decrypt_time_based(&self, encrypted: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.decrypt_time_based_at(encrypted, now())
     }
@@ -144,12 +189,17 @@ impl CryptoService for Crypto {
     ///
     /// Messages are *always* encrypted under the current period's key; the
     /// previous key is only ever a decryption candidate.
-    fn encrypt_time_based_at(&self, msg: &[u8], timestamp: u64) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::NotBlockAligned`] if `msg` is not a multiple of
+    /// [`BLOCK_LEN`] bytes.
+    fn encrypt_time_based_at(&self, msg: &[u8], timestamp: u64) -> Result<Vec<u8>, CryptoError> {
         let counter = timestamp / PERIOD;
-        let mut out = self.encrypt_internal(msg, &self.key_for(counter));
+        let mut out = self.encrypt_internal(msg, &self.key_for(counter))?;
         let tag = hmac(&self.mac_key_for(counter), &out);
         out.extend_from_slice(&tag);
-        out
+        Ok(out)
     }
 
     /// Counterpart to [`encrypt_time_based_at`](Self::encrypt_time_based_at).
@@ -162,6 +212,11 @@ impl CryptoService for Crypto {
     /// The tag is what makes the fallback safe: a wrong key is *detected*
     /// rather than silently yielding garbage, so trying a second key cannot
     /// return the wrong plaintext.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::TooShort`] if `encrypted` is smaller than the
+    /// tag, or [`CryptoError::NotAuthenticated`] if no candidate key verifies.
     fn decrypt_time_based_at(
         &self,
         encrypted: &[u8],
@@ -181,21 +236,22 @@ impl CryptoService for Crypto {
         for candidate in candidates {
             let expected = hmac(&self.mac_key_for(candidate), ciphertext);
             if memcmp::eq(&expected, tag) {
-                return Ok(self.decrypt_internal(ciphertext, &self.key_for(candidate)));
+                return self.decrypt_internal(ciphertext, &self.key_for(candidate));
             }
         }
         Err(CryptoError::NotAuthenticated)
     }
 
-    fn encrypt_internal(&self, msg: &[u8], key: &[u8]) -> Vec<u8> {
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::NotBlockAligned`] if `msg` is misaligned, or
+    /// [`CryptoError::InvalidKeyLength`] if `key` is not a valid AES size.
+    fn encrypt_internal(&self, msg: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if !msg.len().is_multiple_of(BLOCK_LEN) {
-            panic!(
-                "Message vec size must be multiple of {} current {}",
-                BLOCK_LEN,
-                msg.len()
-            );
+            return Err(CryptoError::NotBlockAligned(msg.len()));
         }
-        let encrypt_key = AesKey::new_encrypt(key).unwrap();
+        let encrypt_key =
+            AesKey::new_encrypt(key).map_err(|_| CryptoError::InvalidKeyLength(key.len()))?;
         let mut vec_encrypt = vec![0; msg.len()];
         let mut vec_iv = self.iv.clone();
         aes_ige(
@@ -205,18 +261,19 @@ impl CryptoService for Crypto {
             &mut vec_iv,
             Mode::Encrypt,
         );
-        vec_encrypt
+        Ok(vec_encrypt)
     }
 
-    fn decrypt_internal(&self, encrypted: &[u8], key: &[u8]) -> Vec<u8> {
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::NotBlockAligned`] if `encrypted` is misaligned,
+    /// or [`CryptoError::InvalidKeyLength`] if `key` is not a valid AES size.
+    fn decrypt_internal(&self, encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if !encrypted.len().is_multiple_of(BLOCK_LEN) {
-            panic!(
-                "Encrypted vec size must be multiple of {} current {}",
-                BLOCK_LEN,
-                encrypted.len()
-            );
+            return Err(CryptoError::NotBlockAligned(encrypted.len()));
         }
-        let decrypt_key = AesKey::new_decrypt(key).unwrap();
+        let decrypt_key =
+            AesKey::new_decrypt(key).map_err(|_| CryptoError::InvalidKeyLength(key.len()))?;
         let mut msg = vec![0; encrypted.len()];
         let mut vec_iv = self.iv.clone();
         aes_ige(
@@ -226,7 +283,7 @@ impl CryptoService for Crypto {
             &mut vec_iv,
             Mode::Decrypt,
         );
-        msg
+        Ok(msg)
     }
 
     fn create_key(&self, timestamp: u64) -> Vec<u8> {
@@ -285,6 +342,7 @@ mod tests {
             b"21098765432109876543210987654321".to_vec(),
             b"00010203040506070809".to_vec(),
         )
+        .expect("fixture secrets are valid")
     }
 
     #[test]
@@ -319,6 +377,36 @@ mod tests {
             "{shared}/{} bytes shared between periods",
             a.len()
         );
+    }
+
+    #[test]
+    fn constructor_rejects_bad_secrets() {
+        let good_iv = b"21098765432109876543210987654321".to_vec();
+        let good_tk = b"00010203040506070809".to_vec();
+
+        // `.err()` rather than `.unwrap_err()`: the latter would need a Debug
+        // impl on Crypto, and Crypto holds secrets we do not want printable.
+        assert_eq!(
+            Crypto::new(vec![0; 20], good_iv.clone(), good_tk.clone()).err(),
+            Some(CryptoError::InvalidKeyLength(20))
+        );
+        assert_eq!(
+            Crypto::new(vec![0; 32], vec![0; 16], good_tk).err(),
+            Some(CryptoError::InvalidIvLength(16))
+        );
+        assert_eq!(
+            Crypto::new(vec![0; 32], good_iv, vec![0; 2]).err(),
+            Some(CryptoError::InvalidTimeKeyLength(2))
+        );
+        // All three valid AES sizes are accepted.
+        for len in [16, 24, 32] {
+            assert!(Crypto::new(
+                vec![0; len],
+                vec![0; IV_LEN],
+                b"00010203040506070809".to_vec()
+            )
+            .is_ok());
+        }
     }
 
     #[test]

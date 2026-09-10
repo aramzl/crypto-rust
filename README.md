@@ -17,9 +17,9 @@ Requires OpenSSL 3.x on the build machine (`brew install openssl@3` on macOS).
 ### Usage
 
 ```rust
-use crypto_service::{Crypto, CryptoService, PERIOD};
+use crypto_service::{Crypto, CryptoError, CryptoService, PERIOD};
 
-fn create_crypto() -> Crypto {
+fn create_crypto() -> Result<Crypto, CryptoError> {
     Crypto::new(
         b"12345678901234567890123456789012".to_vec(), // AES key: 16, 24 or 32 bytes
         b"21098765432109876543210987654321".to_vec(), // IV: exactly 32 bytes
@@ -27,11 +27,11 @@ fn create_crypto() -> Crypto {
     )
 }
 
-let crypto = create_crypto();
+let crypto = create_crypto()?;
 let msg = b"Time based tests rust. Secret.!!"; // length must be a multiple of 16
 
-let encrypted = crypto.encrypt_time_based(msg);
-let original = crypto.decrypt_time_based(&encrypted);
+let encrypted = crypto.encrypt_time_based(msg)?;
+let original = crypto.decrypt_time_based(&encrypted)?;
 
 println!("Original {}", String::from_utf8_lossy(&original));
 ```
@@ -59,7 +59,15 @@ match crypto.decrypt_time_based(&encrypted) {
     Ok(plaintext) => { /* tag verified against one of the candidate keys */ }
     Err(CryptoError::NotAuthenticated) => { /* wrong period, or tampered */ }
     Err(CryptoError::TooShort) => { /* shorter than the 32-byte tag */ }
+    Err(e) => { /* bad secret length, or misaligned input */ }
 }
+```
+
+Nothing in the crate panics on caller input: wrong-sized secrets, misaligned
+messages and failed authentication all come back as [`CryptoError`].
+
+```rust
+assert_eq!(crypto.encrypt(&[0u8; 33]).unwrap_err(), CryptoError::NotBlockAligned(33));
 ```
 
 `encrypt_time_based` appends a 32-byte HMAC-SHA256 tag, so the ciphertext is 32

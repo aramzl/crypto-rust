@@ -17,6 +17,7 @@ fn create_crypto() -> Crypto {
         b"21098765432109876543210987654321".to_vec(),
         b"00010203040506070809".to_vec(),
     )
+    .expect("fixture secrets are valid")
 }
 
 #[test]
@@ -24,10 +25,10 @@ fn aes_encryption_round_trips() {
     let msg = b"Hello world from rust. Secret.!!";
     let crypto = create_crypto();
 
-    let encrypted = crypto.encrypt(msg);
+    let encrypted = crypto.encrypt(msg).expect("block-aligned");
     assert_ne!(msg.as_slice(), encrypted.as_slice());
 
-    let original = crypto.decrypt(&encrypted);
+    let original = crypto.decrypt(&encrypted).expect("block-aligned");
     assert_eq!(msg.as_slice(), original.as_slice());
 }
 
@@ -38,7 +39,9 @@ fn synced_parties_exchange_messages_within_a_period() {
     let bob = create_crypto();
 
     // Alice sends early in the period, Bob reads late in the same period.
-    let encrypted = alice.encrypt_time_based_at(msg, BASE);
+    let encrypted = alice
+        .encrypt_time_based_at(msg, BASE)
+        .expect("block-aligned");
     assert_ne!(msg.as_slice(), encrypted.as_slice());
 
     let original = bob
@@ -53,7 +56,9 @@ fn message_is_rejected_once_the_tolerance_window_closes() {
     let alice = create_crypto();
     let bob = create_crypto();
 
-    let encrypted = alice.encrypt_time_based_at(msg, BASE);
+    let encrypted = alice
+        .encrypt_time_based_at(msg, BASE)
+        .expect("block-aligned");
 
     // One full period later, past the grace window, the key has rotated away.
     let err = bob
@@ -70,7 +75,9 @@ fn previous_period_key_is_accepted_inside_the_tolerance_window() {
 
     // Sent in the last second of a period.
     let sent_at = BASE + PERIOD - 1;
-    let encrypted = alice.encrypt_time_based_at(msg, sent_at);
+    let encrypted = alice
+        .encrypt_time_based_at(msg, sent_at)
+        .expect("block-aligned");
 
     // Every instant inside the next period's grace window still decrypts.
     for offset in 0..tolerance() {
@@ -96,8 +103,12 @@ fn messages_are_always_encrypted_with_the_current_key() {
 
     // Encrypting inside the tolerance window must use the *new* key, never the
     // old one that decryption would also accept there.
-    let during_grace = crypto.encrypt_time_based_at(msg, BASE + PERIOD + 1);
-    let previous_period = crypto.encrypt_time_based_at(msg, BASE + PERIOD - 1);
+    let during_grace = crypto
+        .encrypt_time_based_at(msg, BASE + PERIOD + 1)
+        .expect("block-aligned");
+    let previous_period = crypto
+        .encrypt_time_based_at(msg, BASE + PERIOD - 1)
+        .expect("block-aligned");
     assert_ne!(during_grace, previous_period);
 
     // Proof it used the new key: it decrypts at a point where only the new key
@@ -113,8 +124,12 @@ fn ciphertext_changes_between_periods() {
     let msg = b"Time based tests rust. Secret3!!";
     let crypto = create_crypto();
 
-    let first = crypto.encrypt_time_based_at(msg, BASE);
-    let second = crypto.encrypt_time_based_at(msg, BASE + PERIOD);
+    let first = crypto
+        .encrypt_time_based_at(msg, BASE)
+        .expect("block-aligned");
+    let second = crypto
+        .encrypt_time_based_at(msg, BASE + PERIOD)
+        .expect("block-aligned");
     assert_ne!(first, second);
 }
 
@@ -123,7 +138,9 @@ fn tampering_is_detected() {
     let msg = b"Time based tests rust. Secret4!!";
     let crypto = create_crypto();
 
-    let encrypted = crypto.encrypt_time_based_at(msg, BASE);
+    let encrypted = crypto
+        .encrypt_time_based_at(msg, BASE)
+        .expect("block-aligned");
 
     // Flip one bit of the ciphertext...
     let mut flipped = encrypted.clone();
@@ -153,13 +170,30 @@ fn truncated_input_is_rejected() {
 }
 
 #[test]
+fn misaligned_input_is_an_error_not_a_panic() {
+    let crypto = create_crypto();
+
+    // AES-IGE has no padding, so length must be a multiple of BLOCK_LEN.
+    assert_eq!(
+        crypto.encrypt(&[0u8; 33]).unwrap_err(),
+        CryptoError::NotBlockAligned(33)
+    );
+    assert_eq!(
+        crypto.encrypt_time_based_at(&[0u8; 7], BASE).unwrap_err(),
+        CryptoError::NotBlockAligned(7)
+    );
+    // The boundary case: empty input is trivially aligned.
+    assert!(crypto.encrypt(&[]).is_ok());
+}
+
+#[test]
 fn time_based_encryption_round_trips_against_the_wall_clock() {
     let msg = b"Wall clock round trip. Secret!!!";
     let crypto = create_crypto();
 
     // Covers the default now()-based path. The tolerance window now absorbs a
     // period boundary landing between these two calls.
-    let encrypted = crypto.encrypt_time_based(msg);
+    let encrypted = crypto.encrypt_time_based(msg).expect("block-aligned");
     let original = crypto
         .decrypt_time_based(&encrypted)
         .expect("wall-clock round trip must decrypt");
